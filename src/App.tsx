@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Camera,
   CameraOff,
@@ -28,18 +28,9 @@ type Entry = {
   source: 'camera' | 'manual';
 };
 
-type VisitState = {
-  lastSeen: number;
-  detections: number;
-  recorded: boolean;
-};
-
 const STORE = 'gateflow-bus-events-v1';
-
-// Adjust these values to tune automatic detection.
-const ABSENCE_MS = 15000;
-const SCAN_INTERVAL_MS = 2000;
-const REQUIRED_DETECTIONS = 2;
+const CONFIRM_MS = 12000;
+const SCAN_MS = 3000;
 
 const cleanPlate = (value: string) =>
   value
@@ -48,29 +39,90 @@ const cleanPlate = (value: string) =>
     .replace(/^IND(?=[A-Z0-9])/, '')
     .slice(0, 12);
 
-const isValidPlate = (value: string) =>
-  /^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{3,4}$/.test(value);
-
-const formatTime = (iso: string) =>
-  new Date(iso).toLocaleTimeString([], {
+const formatTime = (value: string) =>
+  new Date(value).toLocaleTimeString([], {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
   });
 
-const formatDate = (iso: string) =>
-  new Date(iso).toLocaleDateString([], {
+const formatDate = (value: string) =>
+  new Date(value).toLocaleDateString([], {
     day: '2-digit',
     month: 'short',
     year: 'numeric',
   });
 
+async function getMainRearCameraStream(): Promise<MediaStream> {
+  const devices = navigator.mediaDevices;
+
+  if (!devices?.getUserMedia) {
+    throw new Error('Camera access requires HTTPS or localhost.');
+  }
+
+  // Request permission first so browsers can reveal camera labels.
+  const temporaryStream = await devices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' } },
+    audio: false,
+  });
+
+  temporaryStream.getTracks().forEach((track) => track.stop());
+
+  const cameras = (await devices.enumerateDevices()).filter(
+    (device) => device.kind === 'videoinput'
+  );
+
+  console.table(
+    cameras.map((camera) => ({
+      label: camera.label,
+      deviceId: camera.deviceId,
+    }))
+  );
+
+  // Prefer an explicitly labelled standard/main rear lens.
+  // Do not mistake ultra-wide, macro or telephoto for the main lens.
+  const excludedLens = /ultra.?wide|ultrawide|macro|telephoto|front|selfie/i;
+  const preferredLens = /\b(main|wide|1x|standard|back|rear)\b/i;
+
+  const selectedCamera = cameras.find(
+    (camera) =>
+      preferredLens.test(camera.label) &&
+      !excludedLens.test(camera.label)
+  );
+
+  // Exact device selection works when the browser exposes separate lenses.
+  // Otherwise request the rear-facing camera at the highest ideal resolution.
+  const videoConstraints: MediaTrackConstraints = selectedCamera
+    ? {
+        deviceId: { exact: selectedCamera.deviceId },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      }
+    : {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      };
+
+  const stream = await devices.getUserMedia({
+    video: videoConstraints,
+    audio: false,
+  });
+
+  const track = stream.getVideoTracks()[0];
+
+  if (track) {
+    console.log('Selected camera:', track.label);
+    console.log('Actual camera settings:', track.getSettings());
+  }
+
+  return stream;
+}
+
 export default function App() {
   const [events, setEvents] = useState<Entry[]>(() => {
     try {
-      return JSON.parse(
-        localStorage.getItem(STORE) || '[]'
-      ) as Entry[];
+      return JSON.parse(localStorage.getItem(STORE) || '[]') as Entry[];
     } catch {
       return [];
     }
@@ -81,7 +133,7 @@ export default function App() {
   const [cameraOn, setCameraOn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(
-    'Start the camera to enable automatic IN/OUT recording.'
+    'Start the camera to scan bus plates automatically.'
   );
   const [error, setError] = useState('');
   const [filter, setFilter] = useState<'ALL' | Direction>('ALL');
@@ -89,66 +141,25 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  const scanTimerRef = useRef<number | null>(null);
-  const scanningRef = useRef(false);
+  const busyRef = useRef(false);
   const cameraOnRef = useRef(false);
-  const eventsRef = useRef<Entry[]>(events);
-  const visitsRef = useRef<Map<string, VisitState>>(new Map());
+  const lastConfirmedRef = useRef<Record<string, number>>({});
+  const recognizedRef = useRef<
+    Record<string, { count: number; time: number }>
+  >({});
 
-  // Keep refs current so asynchronous OCR uses the latest data.
   useEffect(() => {
-    eventsRef.current = events;
     localStorage.setItem(STORE, JSON.stringify(events));
   }, [events]);
-
-  useEffect(() => {
-    cameraOnRef.current = cameraOn;
-  }, [cameraOn]);
-
-  // Attach the camera stream after the video element renders.
-  useEffect(() => {
-    if (!cameraOn) return;
-
-    const video = videoRef.current;
-    const stream = streamRef.current;
-
-    if (!video || !stream) return;
-
-    video.srcObject = stream;
-    video.muted = true;
-    video.autoplay = true;
-    video.playsInline = true;
-
-    void video.play().catch(() => {
-      setError(
-        'Video playback failed. Stop and restart the camera.'
-      );
-    });
-
-    return () => {
-      video.onloadedmetadata = null;
-    };
-  }, [cameraOn]);
-
-  useEffect(() => {
-    return () => {
-      if (scanTimerRef.current !== null) {
-        window.clearInterval(scanTimerRef.current);
-      }
-
-      streamRef.current?.getTracks().forEach((track) => {
-        track.stop();
-      });
-    };
-  }, []);
 
   const latestByPlate = useMemo(() => {
     const map = new Map<string, Entry>();
 
-    [...events]
-      .sort((a, b) => a.time.localeCompare(b.time))
-      .forEach((event) => map.set(event.plate, event));
+    for (const event of [...events].sort((a, b) =>
+      a.time.localeCompare(b.time)
+    )) {
+      map.set(event.plate, event);
+    }
 
     return map;
   }, [events]);
@@ -159,174 +170,123 @@ export default function App() {
 
   const todayEvents = events.filter(
     (event) =>
-      new Date(event.time).toDateString() ===
-      new Date().toDateString()
+      new Date(event.time).toDateString() === new Date().toDateString()
   );
-
-  const normalizedQuery = cleanPlate(query);
 
   const filtered = [...events]
     .filter(
       (event) =>
         (filter === 'ALL' || event.direction === filter) &&
-        (!normalizedQuery || event.plate.includes(normalizedQuery))
+        (!cleanPlate(query) || event.plate.includes(cleanPlate(query)))
     )
     .sort((a, b) => b.time.localeCompare(a.time));
+
+  useEffect(() => {
+    if (!cameraOn) return;
+
+    const video = videoRef.current;
+    const stream = streamRef.current;
+
+    if (!video || !stream) return;
+
+    video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
+
+    video.play().catch(() => {
+      setError('Video playback failed. Stop and restart the camera.');
+    });
+  }, [cameraOn]);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
 
   async function startCamera() {
     setError('');
 
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError(
-        'Camera access is unavailable. Open the app on localhost or HTTPS.'
-      );
-      return;
-    }
-
     try {
-      let stream: MediaStream;
+      const stream = await getMainRearCameraStream();
 
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
-          audio: false,
-        });
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
-        });
-      }
-
-      streamRef.current?.getTracks().forEach((track) => {
-        track.stop();
-      });
-
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = stream;
-
-      // Reset tracking for a fresh camera session.
-      visitsRef.current.clear();
-      scanningRef.current = false;
-
+      cameraOnRef.current = true;
       setCameraOn(true);
+
+      const track = stream.getVideoTracks()[0];
+      const settings = track?.getSettings();
+
       setMessage(
-        'Camera started. Automatic plate scanning will begin shortly.'
+        `Camera ready: ${settings?.width ?? '?'} × ${settings?.height ?? '?'} pixels.`
       );
-    } catch (err) {
-      console.error('Camera error:', err);
+    } catch (cameraError) {
+      console.error('Camera startup failed:', cameraError);
       setError(
-        'Could not access the camera. Allow camera permission in Chrome and try again.'
+        'Camera unavailable. Allow camera permission, close other camera apps and try again.'
       );
     }
   }
 
   function stopCamera() {
     cameraOnRef.current = false;
-
-    if (scanTimerRef.current !== null) {
-      window.clearInterval(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
-
-    streamRef.current?.getTracks().forEach((track) => {
-      track.stop();
-    });
-
+    streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
 
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
 
-    visitsRef.current.clear();
-    scanningRef.current = false;
     setCameraOn(false);
-    setBusy(false);
-    setMessage('Camera stopped. Automatic scanning is paused.');
+    setMessage('Camera stopped.');
   }
 
-  // Determine the next movement using the most recent saved event.
-  function saveEvent(
-    detectedPlate: string,
-    source: 'camera' | 'manual',
-    requestedDirection?: Direction
-  ) {
-    const normalized = cleanPlate(detectedPlate);
+  const recordPlate = useCallback(
+    (raw: string, source: 'camera' | 'manual' = 'camera') => {
+      const number = cleanPlate(raw);
 
-    if (!isValidPlate(normalized)) {
-      setError(
-        `Invalid-looking plate: ${normalized}. Check the registration number.`
-      );
-      return false;
-    }
+      if (number.length < 5 || !/[A-Z]/.test(number) || !/\d/.test(number)) {
+        return;
+      }
 
-    const last = [...eventsRef.current]
-      .filter((event) => event.plate === normalized)
-      .sort((a, b) => b.time.localeCompare(a.time))[0];
+      const last = latestByPlate.get(number);
+      const direction: Direction = last?.direction === 'IN' ? 'OUT' : 'IN';
+      const now = new Date().toISOString();
 
-    const next: Direction =
-      requestedDirection ??
-      (last?.direction === 'IN' ? 'OUT' : 'IN');
+      const entry: Entry = {
+        id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+        plate: number,
+        direction,
+        time: now,
+        source,
+      };
 
-    if (last?.direction === next) {
-      setMessage(
-        `${normalized} is already marked ${next}. No duplicate record added.`
-      );
-      return false;
-    }
+      setEvents((old) => [entry, ...old]);
+      setPlate(number);
+      setError('');
+      setMessage(`${number} recorded ${direction} at ${formatTime(now)}.`);
+    },
+    [latestByPlate]
+  );
 
-    const event: Entry = {
-      id:
-        globalThis.crypto?.randomUUID?.() ??
-        `${Date.now()}-${Math.random()}`,
-      plate: normalized,
-      direction: next,
-      time: new Date().toISOString(),
-      source,
-    };
-
-    // Update the ref immediately to avoid duplicate records from
-    // overlapping asynchronous OCR/state updates.
-    const updated = [event, ...eventsRef.current];
-    eventsRef.current = updated;
-    setEvents(updated);
-
-    setPlate(normalized);
-    setError('');
-    setMessage(
-      `Automatic ${next}: ${normalized} at ${formatTime(event.time)}`
-    );
-
-    return true;
-  }
-
-  // OCR one camera frame.
-  async function scanAutomatically() {
-    if (
-      !cameraOnRef.current ||
-      scanningRef.current
-    ) {
-      return;
-    }
-
+  async function scanFrame() {
     const video = videoRef.current;
 
     if (
-      !video ||
-      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
-      !video.videoWidth ||
-      !video.videoHeight
+      busyRef.current ||
+      !cameraOnRef.current ||
+      !video?.videoWidth ||
+      video.readyState < 2
     ) {
       return;
     }
 
-    scanningRef.current = true;
+    busyRef.current = true;
+    setBusy(true);
 
     try {
+      // Use the actual video frame dimensions, not the CSS preview size.
       const canvas = document.createElement('canvas');
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -334,96 +294,69 @@ export default function App() {
       const context = canvas.getContext('2d');
       if (!context) return;
 
-      context.drawImage(video, 0, 0);
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
 
       const result = await Tesseract.recognize(canvas, 'eng');
+
       if (!cameraOnRef.current) return;
 
-      const rawText = result.data.text.toUpperCase();
+      const candidates = result.data.text
+        .toUpperCase()
+        .split(/[\s\n]+/)
+        .map(cleanPlate)
+        .filter(
+          (value) =>
+            value.length >= 7 && /[A-Z]/.test(value) && /\d/.test(value)
+        );
 
-      // Match common Indian registration formats even if OCR includes
-      // spaces between the state, district, series and number.
-      const candidates =
-        rawText.match(
-          /[A-Z]{2}[\s-]*\d{1,2}[\s-]*[A-Z]{1,3}[\s-]*\d{3,4}/g
-        ) ?? [];
-
-      const plateCandidates = [
-        ...new Set(candidates.map(cleanPlate).filter(isValidPlate)),
-      ];
-
+      const found = candidates.sort((a, b) => b.length - a.length)[0];
       const now = Date.now();
 
-      // Mark previously tracked plates absent when not recognized for
-      // the configured interval. The same plate can then start a new visit.
-      for (const [trackedPlate, state] of visitsRef.current.entries()) {
-        if (
-          now - state.lastSeen > ABSENCE_MS &&
-          !plateCandidates.includes(trackedPlate)
-        ) {
-          visitsRef.current.delete(trackedPlate);
-        }
-      }
-
-      if (plateCandidates.length === 0) {
+      if (!found) {
+        setMessage('Scanning… keep the plate close, clear and well lit.');
         return;
       }
 
-      // This simple OCR approach handles one plate candidate per frame.
-      // Multiple candidates are ignored to reduce accidental recordings.
-      if (plateCandidates.length !== 1) {
+      setPlate(found);
+
+      const previous = recognizedRef.current[found];
+      const count =
+        previous && now - previous.time < 10000 ? previous.count + 1 : 1;
+
+      recognizedRef.current[found] = { count, time: now };
+
+      if (count < 2) {
+        setMessage(`Detected ${found}. Confirming with another scan…`);
         return;
       }
 
-      const detected = plateCandidates[0];
-      const previous = visitsRef.current.get(detected);
+      const lastRecordTime = lastConfirmedRef.current[found] || 0;
 
-      if (!previous) {
-        visitsRef.current.set(detected, {
-          lastSeen: now,
-          detections: 1,
-          recorded: false,
-        });
-
-        setMessage(`Plate candidate seen: ${detected}. Confirming…`);
+      if (now - lastRecordTime < CONFIRM_MS) {
+        setMessage(`${found} is still in view. Waiting before the next record.`);
         return;
       }
 
-      // Keep the detection alive while the plate remains visible.
-      previous.lastSeen = now;
-      previous.detections += 1;
-
-      if (
-        previous.detections >= REQUIRED_DETECTIONS &&
-        !previous.recorded
-      ) {
-        const saved = saveEvent(detected, 'camera');
-        previous.recorded = saved;
-      }
-    } catch (err) {
-      console.error('Automatic OCR failed:', err);
-      setMessage(
-        'OCR could not read this frame. Keep the plate clear and well lit.'
-      );
+      recordPlate(found, 'camera');
+      lastConfirmedRef.current[found] = now;
+      recognizedRef.current[found] = { count: 0, time: now };
+    } catch (scanError) {
+      console.error('OCR scan failed:', scanError);
+      setMessage('Could not read the plate. Improve lighting or enter it manually.');
     } finally {
-      scanningRef.current = false;
+      busyRef.current = false;
+      setBusy(false);
     }
   }
 
-  // Automatically repeat OCR while the camera is running.
   useEffect(() => {
     if (!cameraOn) return;
 
-    scanTimerRef.current = window.setInterval(() => {
-      void scanAutomatically();
-    }, SCAN_INTERVAL_MS);
+    const timer = window.setInterval(() => {
+      void scanFrame();
+    }, SCAN_MS);
 
-    return () => {
-      if (scanTimerRef.current !== null) {
-        window.clearInterval(scanTimerRef.current);
-        scanTimerRef.current = null;
-      }
-    };
+    return () => window.clearInterval(timer);
   }, [cameraOn]);
 
   async function readImage(image: Blob | string) {
@@ -433,69 +366,56 @@ export default function App() {
 
     try {
       const result = await Tesseract.recognize(image, 'eng');
-      const rawText = result.data.text.toUpperCase();
 
-      const candidates =
-        rawText.match(
-          /[A-Z]{2}[\s-]*\d{1,2}[\s-]*[A-Z]{1,3}[\s-]*\d{3,4}/g
-        ) ?? [];
-
-      const detected = candidates.map(cleanPlate).find(isValidPlate);
-
-      if (detected) {
-        setPlate(detected);
-        setMessage(`Plate read: ${detected}.`);
-      } else {
-        setMessage(
-          'No valid-looking plate found. Try a closer, clearer image.'
+      const candidates = result.data.text
+        .toUpperCase()
+        .split(/[\s\n]+/)
+        .map(cleanPlate)
+        .filter(
+          (value) =>
+            value.length >= 7 && /[A-Z]/.test(value) && /\d/.test(value)
         );
+
+      const found = candidates.sort((a, b) => b.length - a.length)[0];
+
+      if (found) {
+        setPlate(found);
+        setMessage(`Possible plate: ${found}. Verify it before recording.`);
+      } else {
+        setMessage('No plate found. Try a clearer image or type the number manually.');
       }
-    } catch (err) {
-      console.error('Image OCR failed:', err);
-      setError('Could not process the image. Try another photo.');
+    } catch (imageError) {
+      console.error('Image OCR failed:', imageError);
+      setError('Unable to read this image.');
     } finally {
       setBusy(false);
     }
   }
 
-  async function capture() {
-    const video = videoRef.current;
+  function manualRecord(direction?: Direction) {
+    const number = cleanPlate(plate);
 
-    if (!video || !video.videoWidth) {
-      setError('Wait for the camera preview to appear first.');
+    if (number.length < 5 || !/[A-Z]/.test(number) || !/\d/.test(number)) {
+      setError('Enter a valid plate containing letters and numbers.');
       return;
     }
 
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    const context = canvas.getContext('2d');
-
-    if (!context) return;
-
-    context.drawImage(video, 0, 0);
-
-    canvas.toBlob(
-      async (blob) => {
-        if (blob) await readImage(blob);
-      },
-      'image/jpeg',
-      0.95
-    );
-  }
-
-  function recordManual(direction?: Direction) {
-    const normalized = cleanPlate(plate);
-
-    if (!isValidPlate(normalized)) {
-      setError(
-        'Enter a valid-looking registration number, such as TN01AB1234.'
-      );
+    if (!direction) {
+      recordPlate(number, 'manual');
       return;
     }
 
-    saveEvent(normalized, 'manual', direction);
+    const event: Entry = {
+      id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+      plate: number,
+      direction,
+      time: new Date().toISOString(),
+      source: 'manual',
+    };
+
+    setEvents((old) => [event, ...old]);
+    setMessage(`${number} recorded ${direction} at ${formatTime(event.time)}.`);
+    setError('');
   }
 
   function exportCsv() {
@@ -512,9 +432,7 @@ export default function App() {
 
     const csv = rows
       .map((row) =>
-        row
-          .map((value) => `"${String(value).replace(/"/g, '""')}"`)
-          .join(',')
+        row.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(',')
       )
       .join('\n');
 
@@ -522,38 +440,27 @@ export default function App() {
       new Blob([csv], { type: 'text/csv;charset=utf-8;' })
     );
 
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'bus-gate-records.csv';
-    link.click();
-
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'bus-gate-records.csv';
+    anchor.click();
     URL.revokeObjectURL(url);
   }
 
   function removeAll() {
-    if (
-      confirm(
-        'Delete all bus gate records stored in this browser? This cannot be undone.'
-      )
-    ) {
-      eventsRef.current = [];
+    if (confirm('Delete all bus gate records stored in this browser?')) {
       setEvents([]);
-      visitsRef.current.clear();
     }
   }
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand-mark">
-          <BusFront size={23} />
-        </div>
-
+        <div className="brand-mark"><BusFront size={23} /></div>
         <div className="brand-copy">
           <strong>GateFlow</strong>
           <span>BUS NUMBER PLATE TRACKER</span>
         </div>
-
         <div className="top-spacer" />
         <span className="live-dot" />
         <span className="system-label">LOCAL SYSTEM</span>
@@ -564,12 +471,8 @@ export default function App() {
           <div>
             <div className="eyebrow">COLLEGE GATE AUTOMATION</div>
             <h1>Bus movement control</h1>
-            <p>
-              Automatically detect bus plates and record gate
-              movements.
-            </p>
+            <p>Scan a bus number plate and record its arrival or departure time.</p>
           </div>
-
           <div className="date-chip">
             <Clock3 size={16} />
             {new Date().toLocaleDateString([], {
@@ -583,55 +486,24 @@ export default function App() {
 
         <section className="stats">
           <div className="stat-card">
-            <div className="stat-icon blue">
-              <BusFront size={20} />
-            </div>
-            <div>
-              <span>Buses currently inside</span>
-              <strong>{busesInside}</strong>
-              <small>Based on latest movement</small>
-            </div>
+            <div className="stat-icon blue"><BusFront size={20} /></div>
+            <div><span>Buses currently inside</span><strong>{busesInside}</strong><small>Based on latest movement</small></div>
           </div>
-
           <div className="stat-card">
-            <div className="stat-icon green">
-              <ArrowDownToLine size={20} />
-            </div>
-            <div>
-              <span>Today's arrivals</span>
-              <strong>
-                {todayEvents.filter((e) => e.direction === 'IN').length}
-              </strong>
-              <small>Recorded today</small>
-            </div>
+            <div className="stat-icon green"><ArrowDownToLine size={20} /></div>
+            <div><span>Today's arrivals</span><strong>{todayEvents.filter((event) => event.direction === 'IN').length}</strong><small>Recorded today</small></div>
           </div>
-
           <div className="stat-card">
-            <div className="stat-icon amber">
-              <ArrowUpFromLine size={20} />
-            </div>
-            <div>
-              <span>Today's departures</span>
-              <strong>
-                {todayEvents.filter((e) => e.direction === 'OUT').length}
-              </strong>
-              <small>Recorded today</small>
-            </div>
+            <div className="stat-icon amber"><ArrowUpFromLine size={20} /></div>
+            <div><span>Today's departures</span><strong>{todayEvents.filter((event) => event.direction === 'OUT').length}</strong><small>Recorded today</small></div>
           </div>
         </section>
 
         <section className="workspace">
           <div className="panel scanner-panel">
             <div className="panel-heading">
-              <div>
-                <div className="eyebrow">CAMERA / AUTOMATIC OCR</div>
-                <h2>Number plate scanner</h2>
-              </div>
-
-              <span className={`status-pill ${cameraOn ? 'active' : ''}`}>
-                <span />
-                {cameraOn ? 'CAMERA ON' : 'READY'}
-              </span>
+              <div><div className="eyebrow">CAMERA / IMAGE OCR</div><h2>Number plate scanner</h2></div>
+              <span className={`status-pill ${cameraOn ? 'active' : ''}`}><span />{cameraOn ? 'CAMERA ON' : 'READY'}</span>
             </div>
 
             <div className="camera-stage">
@@ -641,66 +513,37 @@ export default function App() {
                   autoPlay
                   playsInline
                   muted
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'cover',
+                    backgroundColor: '#050a12',
+                  }}
                 />
               ) : (
                 <div className="camera-placeholder">
-                  <div className="scan-frame">
-                    <ScanLine size={38} />
-                  </div>
+                  <div className="scan-frame"><ScanLine size={38} /></div>
                   <strong>Position the number plate</strong>
                   <span>Keep the plate level, clear and well lit.</span>
                 </div>
               )}
-
-              {cameraOn && (
-                <div className="camera-overlay">
-                  <span>ALIGN PLATE INSIDE FRAME</span>
-                </div>
-              )}
-
-              {busy && (
-                <div className="busy-overlay">
-                  <RefreshCw className="spin" size={26} />
-                  <span>Reading number plate…</span>
-                </div>
-              )}
+              {cameraOn && <div className="camera-overlay"><span>ALIGN PLATE INSIDE FRAME</span></div>}
+              {busy && <div className="busy-overlay"><RefreshCw className="spin" size={26} /><span>Reading number plate…</span></div>}
             </div>
 
             <div className="camera-actions">
-              <button
-                className="button secondary"
-                onClick={cameraOn ? stopCamera : startCamera}
-              >
-                {cameraOn ? (
-                  <CameraOff size={17} />
-                ) : (
-                  <Camera size={17} />
-                )}
+              <button className="button secondary" onClick={cameraOn ? stopCamera : startCamera}>
+                {cameraOn ? <CameraOff size={17} /> : <Camera size={17} />}
                 {cameraOn ? 'Stop camera' : 'Start camera'}
               </button>
-
-              <button
-                className="button primary"
-                onClick={capture}
-                disabled={!cameraOn || busy}
-              >
-                <ScanLine size={17} />
-                Capture & read
+              <button className="button primary" onClick={() => void scanFrame()} disabled={!cameraOn || busy}>
+                <ScanLine size={17} /> Scan now
               </button>
             </div>
 
-            <div className="or-divider">
-              <span>OR UPLOAD A PHOTO</span>
-            </div>
-
-            <button
-              className="upload-button"
-              onClick={() => fileRef.current?.click()}
-              disabled={busy}
-            >
-              Choose plate image
-            </button>
-
+            <div className="or-divider"><span>OR UPLOAD A PHOTO</span></div>
+            <button className="upload-button" onClick={() => fileRef.current?.click()} disabled={busy}>Choose plate image</button>
             <input
               ref={fileRef}
               type="file"
@@ -712,161 +555,67 @@ export default function App() {
                 event.currentTarget.value = '';
               }}
             />
-
-            <div className="notice">
-              <AlertCircle size={16} />
-              <span>
-                Automatic scanning runs every 2 seconds. Keep a clear
-                registration plate in view. OCR may misread characters.
-              </span>
-            </div>
+            <div className="notice"><AlertCircle size={16} /><span>Automatic OCR is a best-effort reader. Verify number plates before using official records.</span></div>
           </div>
 
           <div className="panel record-panel">
             <div className="eyebrow">GATE LOG</div>
             <h2>Record bus movement</h2>
-            <p className="subtext">
-              Camera detections record movement automatically.
-              Manual entry is available as a fallback.
-            </p>
+            <p className="subtext">Camera detections record movement automatically. Manual entry is available as a fallback.</p>
 
-            <label className="field-label" htmlFor="plate">
-              BUS NUMBER PLATE
-            </label>
-
+            <label className="field-label" htmlFor="plate">BUS NUMBER PLATE</label>
             <div className="plate-input-wrap">
               <div className="india-tag">IND</div>
               <input
                 id="plate"
                 value={plate}
-                onChange={(event) =>
-                  setPlate(event.target.value.toUpperCase())
-                }
+                onChange={(event) => setPlate(event.target.value.toUpperCase())}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter') recordManual();
+                  if (event.key === 'Enter') manualRecord();
                 }}
                 placeholder="e.g. TN01AB1234"
                 maxLength={14}
               />
-
-              <button
-                className="clear-input"
-                onClick={() => setPlate('')}
-                aria-label="Clear plate"
-              >
-                <X size={16} />
-              </button>
+              <button className="clear-input" onClick={() => setPlate('')} aria-label="Clear plate"><X size={16} /></button>
             </div>
-
-            <div className="input-hint">
-              Detected plates appear here. You can edit them before manual
-              recording.
-            </div>
+            <div className="input-hint">Detected numbers can be corrected before manual recording.</div>
 
             {plate && (
               <div className="detected-card">
-                <div className="detected-check">
-                  <CheckCircle2 size={17} />
-                </div>
-                <div>
-                  <span>PLATE TO RECORD</span>
-                  <strong>{cleanPlate(plate)}</strong>
-                </div>
-                <button
-                  className="edit-link"
-                  onClick={() => setPlate(cleanPlate(plate))}
-                >
-                  Normalize
-                </button>
+                <div className="detected-check"><CheckCircle2 size={17} /></div>
+                <div><span>PLATE TO RECORD</span><strong>{cleanPlate(plate)}</strong></div>
+                <button className="edit-link" onClick={() => setPlate(cleanPlate(plate))}>Normalize</button>
               </div>
             )}
 
-            {error && (
-              <div className="error-message">
-                <AlertCircle size={16} />
-                {error}
-              </div>
-            )}
+            {error && <div className="error-message"><AlertCircle size={16} />{error}</div>}
 
             <div className="record-buttons">
-              <button
-                className="button arrival"
-                onClick={() => recordManual('IN')}
-              >
-                <ArrowDownToLine size={18} />
-                <span>
-                  Record IN
-                  <small>Manual arrival fallback</small>
-                </span>
+              <button className="button arrival" onClick={() => manualRecord('IN')}>
+                <ArrowDownToLine size={18} /><span>Record IN<small>Manual arrival record</small></span>
               </button>
-
-              <button
-                className="button departure"
-                onClick={() => recordManual('OUT')}
-              >
-                <ArrowUpFromLine size={18} />
-                <span>
-                  Record OUT
-                  <small>Manual departure fallback</small>
-                </span>
+              <button className="button departure" onClick={() => manualRecord('OUT')}>
+                <ArrowUpFromLine size={18} /><span>Record OUT<small>Manual departure record</small></span>
               </button>
             </div>
 
-            <div className="message-line">
-              <CheckCircle2 size={15} />
-              {message}
-            </div>
-
-            <div className="rule-note">
-              <strong>Automatic rule:</strong> First confirmed detection
-              records IN. After 15 seconds without detection, the next
-              confirmed visit records OUT. This is an experimental
-              visibility-based rule, not true direction detection.
-            </div>
+            <div className="message-line"><CheckCircle2 size={15} />{message}</div>
+            <div className="rule-note"><strong>Automatic rule:</strong> First confirmed plate detection records IN. The next confirmed visit records OUT, then alternates. A camera cannot determine actual direction of travel by itself.</div>
           </div>
         </section>
 
         <section className="panel log-panel">
           <div className="log-header">
-            <div>
-              <div className="eyebrow">MOVEMENT HISTORY</div>
-              <h2>
-                Recent gate records{' '}
-                <span className="count-badge">{filtered.length}</span>
-              </h2>
-            </div>
-
-            <button
-              className="button secondary export-btn"
-              onClick={exportCsv}
-            >
-              <Download size={16} />
-              Export CSV
-            </button>
+            <div><div className="eyebrow">MOVEMENT HISTORY</div><h2>Recent gate records <span className="count-badge">{filtered.length}</span></h2></div>
+            <button className="button secondary export-btn" onClick={exportCsv}><Download size={16} />Export CSV</button>
           </div>
 
           <div className="toolbar">
-            <div className="search-box">
-              <Search size={17} />
-              <input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search plate number…"
-              />
-            </div>
-
+            <div className="search-box"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search plate number…" /></div>
             <div className="filter-group">
               {(['ALL', 'IN', 'OUT'] as const).map((value) => (
-                <button
-                  key={value}
-                  className={filter === value ? 'selected' : ''}
-                  onClick={() => setFilter(value)}
-                >
-                  {value === 'ALL'
-                    ? 'All records'
-                    : value === 'IN'
-                      ? 'Arrivals'
-                      : 'Departures'}
+                <button key={value} className={filter === value ? 'selected' : ''} onClick={() => setFilter(value)}>
+                  {value === 'ALL' ? 'All records' : value === 'IN' ? 'Arrivals' : 'Departures'}
                 </button>
               ))}
             </div>
@@ -874,82 +623,35 @@ export default function App() {
 
           <div className="table-wrap">
             <table>
-              <thead>
-                <tr>
-                  <th>BUS PLATE</th>
-                  <th>MOVEMENT</th>
-                  <th>DATE</th>
-                  <th>TIME</th>
-                  <th>METHOD</th>
-                </tr>
-              </thead>
-
+              <thead><tr><th>BUS PLATE</th><th>MOVEMENT</th><th>DATE</th><th>TIME</th><th>METHOD</th></tr></thead>
               <tbody>
                 {filtered.slice(0, 100).map((event) => (
                   <tr key={event.id}>
-                    <td>
-                      <span className="plate-badge">{event.plate}</span>
-                    </td>
-                    <td>
-                      <span
-                        className={`direction ${event.direction.toLowerCase()}`}
-                      >
-                        {event.direction === 'IN' ? (
-                          <ArrowDownToLine size={14} />
-                        ) : (
-                          <ArrowUpFromLine size={14} />
-                        )}
-                        {event.direction}
-                      </span>
-                    </td>
+                    <td><span className="plate-badge">{event.plate}</span></td>
+                    <td><span className={`direction ${event.direction.toLowerCase()}`}>{event.direction === 'IN' ? <ArrowDownToLine size={14} /> : <ArrowUpFromLine size={14} />}{event.direction}</span></td>
                     <td>{formatDate(event.time)}</td>
-                    <td className="time-cell">
-                      {formatTime(event.time)}
-                    </td>
-                    <td>
-                      <span className="method-label">
-                        {event.source === 'camera'
-                          ? 'Camera / OCR'
-                          : 'Manual'}
-                      </span>
-                    </td>
+                    <td className="time-cell">{formatTime(event.time)}</td>
+                    <td><span className="method-label">{event.source === 'camera' ? 'Camera / OCR' : 'Manual'}</span></td>
                   </tr>
                 ))}
-
                 {filtered.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="empty-state">
-                      <div className="empty-icon">
-                        <BusFront size={24} />
-                      </div>
-                      <strong>No records yet</strong>
-                      <span>
-                        Start the camera and show a clear bus plate.
-                      </span>
-                    </td>
-                  </tr>
+                  <tr><td colSpan={5} className="empty-state">
+                    <div className="empty-icon"><BusFront size={24} /></div>
+                    <strong>No records yet</strong>
+                    <span>Scan a plate or enter one manually to create the first record.</span>
+                  </td></tr>
                 )}
               </tbody>
             </table>
           </div>
 
           <div className="table-footer">
-            <span>
-              Showing {Math.min(filtered.length, 100)} of {filtered.length}
-              {' '}records · Stored in this browser
-            </span>
-
-            <button className="text-danger" onClick={removeAll}>
-              <Trash2 size={14} />
-              Clear records
-            </button>
+            <span>Showing {Math.min(filtered.length, 100)} of {filtered.length} records · Stored in this browser</span>
+            <button className="text-danger" onClick={removeAll}><Trash2 size={14} />Clear records</button>
           </div>
         </section>
 
-        <footer>
-          GateFlow Bus Tracker <span>•</span> Browser-based prototype
-          <span>•</span> Records are stored locally on this device
-        </footer>
+        <footer>GateFlow Bus Tracker <span>•</span> Browser-based prototype <span>•</span> Records stored locally on this device</footer>
       </main>
     </div>
   );
