@@ -10,6 +10,7 @@ import "./styles.css";
 
 type Direction = "IN" | "OUT";
 type Source = "camera" | "image" | "manual";
+
 type Entry = {
   id: string;
   plate: string;
@@ -20,10 +21,14 @@ type Entry = {
 
 const STORAGE_KEY = "gateflow-bus-events-v1";
 const ABSENCE_WINDOW = 10000;
-const SCAN_INTERVAL = 900;
+const CANDIDATE_WINDOW = 5000;
+const SCAN_INTERVAL = 1200;
 
 function cleanPlate(value: string) {
-  return value.toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^IND(?=[A-Z0-9])/, "").slice(0, 12);
+  return value.toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .replace(/^IND(?=[A-Z0-9])/, "")
+    .slice(0, 12);
 }
 
 function validPlate(value: string) {
@@ -41,13 +46,17 @@ function readEntries(): Entry[] {
 
 function displayTime(value: string) {
   return new Date(value).toLocaleTimeString([], {
-    hour: "2-digit", minute: "2-digit", second: "2-digit"
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
   });
 }
 
 function displayDate(value: string) {
   return new Date(value).toLocaleDateString([], {
-    day: "2-digit", month: "short", year: "numeric"
+    day: "2-digit",
+    month: "short",
+    year: "numeric"
   });
 }
 
@@ -73,14 +82,15 @@ export default function App() {
   const busyRef = useRef(false);
   const timerRef = useRef<number | null>(null);
 
-  // Last time OCR detected each plate.
+  // Camera presence tracking: a plate is recorded once per appearance.
   const lastSeenRef = useRef<Record<string, number>>({});
-
-  // Track repeated matching OCR readings before accepting a new event.
+  const recordedPresenceRef = useRef<Record<string, boolean>>({});
   const candidateRef = useRef({ plate: "", count: 0, time: 0 });
+  const entriesRef = useRef<Entry[]>(entries);
 
-  // Prevent two asynchronous camera results from recording the same event.
-  const recordingRef = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    entriesRef.current = entries;
+  }, [entries]);
 
   useEffect(() => {
     try {
@@ -90,10 +100,11 @@ export default function App() {
     }
   }, [entries]);
 
+  // Load OCR once.
   useEffect(() => {
     let cancelled = false;
 
-    const init = async () => {
+    async function init() {
       try {
         const promise = createWorker("eng");
         workerPromiseRef.current = promise;
@@ -118,7 +129,7 @@ export default function App() {
           setError("OCR engine failed to load. Check your internet connection and refresh.");
         }
       }
-    };
+    }
 
     void init();
 
@@ -126,11 +137,15 @@ export default function App() {
       cancelled = true;
       cameraRef.current = false;
 
-      if (timerRef.current) window.clearTimeout(timerRef.current);
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
 
       streamRef.current?.getTracks().forEach(track => track.stop());
 
-      if (workerRef.current) void workerRef.current.terminate();
+      if (workerRef.current) {
+        void workerRef.current.terminate();
+      }
     };
   }, []);
 
@@ -141,6 +156,7 @@ export default function App() {
     }
   }, [cameraOn, page]);
 
+  // Add a movement. Camera direction alternates based on the latest saved event.
   const recordPlate = useCallback((
     raw: string,
     source: Source,
@@ -153,43 +169,29 @@ export default function App() {
       return false;
     }
 
-    // A camera event can only be accepted after the plate has been absent
-    // for at least ABSENCE_WINDOW. Image and manual entries are explicit actions.
-    const now = Date.now();
-    const lastSeen = lastSeenRef.current[number] || 0;
+    // entriesRef is newest-first, so find() returns the latest movement.
+    const previous = entriesRef.current.find(item => item.plate === number);
 
-    if (
-      source === "camera" &&
-      lastSeen > 0 &&
-      now - lastSeen < ABSENCE_WINDOW
-    ) {
-      setStatus(`${number} is still being detected. Duplicate event ignored.`);
-      return false;
-    }
-
-    // Keep direction alternating based on the latest saved movement.
-    const previous = entries
-      .filter(item => item.plate === number)
-      .sort((a, b) => b.time.localeCompare(a.time))[0];
-
-    const movement: Direction =
-      direction || (previous?.direction === "IN" ? "OUT" : "IN");
+    const movement: Direction = direction ??
+      (previous?.direction === "IN" ? "OUT" : "IN");
 
     const item: Entry = {
-      id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+      id: crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
       plate: number,
       direction: movement,
       time: new Date().toISOString(),
       source
     };
 
-    setEntries(old => [item, ...old]);
+    const updated = [item, ...entriesRef.current];
+    entriesRef.current = updated;
+    setEntries(updated);
     setPlate(number);
     setError("");
-    setStatus(`✓ ${number} successfully recorded as ${movement}.`);
+    setStatus(`${number} recorded as ${movement}.`);
 
     return true;
-  }, [entries]);
+  }, []);
 
   async function getWorker() {
     if (workerRef.current) return workerRef.current;
@@ -217,6 +219,7 @@ export default function App() {
       const worker = await getWorker();
       const result = await worker.recognize(image);
       const text = result.data.text.toUpperCase();
+
       const tokens = text.split(/[\s\n:;|]+/).map(cleanPlate);
       const compact = cleanPlate(text);
 
@@ -225,64 +228,56 @@ export default function App() {
         .sort((a, b) => b.length - a.length)[0];
 
       if (!match) {
-        candidateRef.current = { plate: "", count: 0, time: 0 };
         setStatus("No plate detected in this frame. Keep scanning or use Capture now.");
         return;
       }
 
       setPlate(match);
 
-      const now = Date.now();
-      const old = candidateRef.current;
-      const count =
-        old.plate === match && now - old.time < 5000
-          ? old.count + 1
-          : 1;
-
-      candidateRef.current = {
-        plate: match,
-        count,
-        time: now
-      };
-
+      // Uploads and captures identify a plate without automatically recording it.
       if (source === "image") {
-        // Capture/upload are deliberate scan actions.
-        recordPlate(match, "image");
-        candidateRef.current = { plate: "", count: 0, time: 0 };
+        setStatus(`Image read: ${match}. Verify the number, then choose Record IN or Record OUT.`);
         return;
       }
 
-      if (source === "camera") {
-        const lastSeen = lastSeenRef.current[match] || 0;
-        const wasAbsentLongEnough =
-          lastSeen === 0 || now - lastSeen >= ABSENCE_WINDOW;
+      const now = Date.now();
+      const previousSeen = lastSeenRef.current[match] || 0;
 
-        // Update last-seen time on every successful detection, even when
-        // the plate is not yet eligible for another event.
-        lastSeenRef.current[match] = now;
+      // IMPORTANT: check the old timestamp before updating it.
+      const newAppearance =
+        previousSeen === 0 || now - previousSeen >= ABSENCE_WINDOW;
 
-        if (!wasAbsentLongEnough) {
-          setStatus(`${match} is still in view. Waiting for it to leave before recording again.`);
-          return;
+      if (newAppearance) {
+        recordedPresenceRef.current[match] = false;
+      }
+
+      lastSeenRef.current[match] = now;
+
+      // Require two matching readings within the candidate window.
+      const old = candidateRef.current;
+      const count =
+        old.plate === match && now - old.time < CANDIDATE_WINDOW
+          ? old.count + 1
+          : 1;
+
+      candidateRef.current = { plate: match, count, time: now };
+
+      // Only one record is allowed during a continuous appearance.
+      if (count >= 2 && !recordedPresenceRef.current[match]) {
+        // Set the flag before saving to guard against duplicate frames.
+        recordedPresenceRef.current[match] = true;
+
+        const saved = recordPlate(match, "camera");
+
+        if (saved) {
+          setStatus(`${match} recorded once for this camera appearance.`);
+        } else {
+          recordedPresenceRef.current[match] = false;
         }
-
-        // Require two matching reads before recording a new appearance.
-        if (count >= 2 && !recordingRef.current[match]) {
-          recordingRef.current[match] = true;
-
-          try {
-            // recordPlate normally checks lastSeenRef; remove this plate's
-            // timestamp briefly so this confirmed reappearance can be saved.
-            delete lastSeenRef.current[match];
-            recordPlate(match, "camera");
-            lastSeenRef.current[match] = now;
-          } finally {
-            recordingRef.current[match] = false;
-            candidateRef.current = { plate: "", count: 0, time: 0 };
-          }
-        } else if (count < 2) {
-          setStatus(`Possible plate: ${match}. Confirming detection…`);
-        }
+      } else if (recordedPresenceRef.current[match]) {
+        setStatus(`${match} is still in view. Duplicate frame ignored.`);
+      } else {
+        setStatus(`Possible plate: ${match}. Checking next frame…`);
       }
     } catch (e) {
       console.error(e);
@@ -345,12 +340,13 @@ export default function App() {
       streamRef.current = stream;
       cameraRef.current = true;
 
-      // Keep previously recorded plates remembered across a camera restart.
-      // The next event is accepted only after a fresh absence interval.
+      // Start a fresh tracking session.
+      lastSeenRef.current = {};
+      recordedPresenceRef.current = {};
       candidateRef.current = { plate: "", count: 0, time: 0 };
 
       setCameraOn(true);
-      setStatus("Camera live. Tracking detected plates automatically.");
+      setStatus("Camera live. The full view is scanned automatically.");
 
       timerRef.current = window.setTimeout(() => void scan(), 700);
     } catch (e) {
@@ -362,14 +358,15 @@ export default function App() {
   function stopCamera() {
     cameraRef.current = false;
 
-    if (timerRef.current) window.clearTimeout(timerRef.current);
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
 
     streamRef.current?.getTracks().forEach(track => track.stop());
     streamRef.current = null;
 
     if (videoRef.current) videoRef.current.srcObject = null;
-
-    candidateRef.current = { plate: "", count: 0, time: 0 };
 
     setCameraOn(false);
     setStatus("Camera stopped. Saved records are still available.");
@@ -414,9 +411,9 @@ export default function App() {
     ];
 
     const csv = rows
-      .map(row =>
-        row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(",")
-      )
+      .map(row => row.map(value =>
+        `"${String(value).replace(/"/g, '""')}"`
+      ).join(","))
       .join("\n");
 
     const url = URL.createObjectURL(
@@ -434,9 +431,10 @@ export default function App() {
   function clearRecords() {
     if (window.confirm("Delete all records saved in this browser?")) {
       setEntries([]);
+      entriesRef.current = [];
       lastSeenRef.current = {};
+      recordedPresenceRef.current = {};
       candidateRef.current = { plate: "", count: 0, time: 0 };
-      recordingRef.current = {};
       setStatus("All local records cleared.");
     }
   }
@@ -465,25 +463,29 @@ export default function App() {
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
         <div className="brand">
-          <div className="brand-icon"><BusFront size={24}/></div>
+          <div className="brand-icon"><BusFront size={24} /></div>
           <div><strong>GateFlow</strong><span>SMART GATE APP</span></div>
         </div>
+
         <div className="nav-label">WORKSPACE</div>
+
         <button
           className={`nav-item ${page === "scanner" ? "nav-active" : ""}`}
           onClick={() => { setPage("scanner"); setMenuOpen(false); }}
         >
-          <Camera size={18}/> Live scanner
+          <Camera size={18} /> Live scanner
         </button>
+
         <button
           className={`nav-item ${page === "history" ? "nav-active" : ""}`}
           onClick={() => { setPage("history"); setMenuOpen(false); }}
         >
-          <History size={18}/> Movement history
+          <History size={18} /> Movement history
         </button>
+
         <div className="sidebar-bottom">
           <div className="security-mark">
-            <ShieldCheck size={18}/>
+            <ShieldCheck size={18} />
             <div><strong>Local-first storage</strong><span>Records saved in this browser</span></div>
           </div>
           <div className="version">GATEFLOW · EXPO PROTOTYPE</div>
@@ -497,14 +499,16 @@ export default function App() {
             onClick={() => setMenuOpen(!menuOpen)}
             aria-label="Toggle navigation"
           >
-            <Menu size={21}/>
+            <Menu size={21} />
           </button>
+
           <div>
             <span className="header-kicker">COLLEGE TRANSPORT</span>
             <h1>{page === "scanner" ? "Live bus scanner" : "Movement history"}</h1>
           </div>
+
           <div className="header-status">
-            <span className={`status-light ${cameraOn ? "light-on" : ""}`}/>
+            <span className={`status-light ${cameraOn ? "light-on" : ""}`} />
             {cameraOn ? "CAMERA LIVE" : "SYSTEM READY"}
           </div>
         </header>
@@ -517,7 +521,7 @@ export default function App() {
               <p>Recognize a plate, verify the result, and record the bus movement.</p>
             </div>
             <div className="today-chip">
-              <Clock3 size={16}/>
+              <Clock3 size={16} />
               {new Date().toLocaleDateString([], {
                 weekday: "short", day: "numeric", month: "short"
               })}
@@ -526,16 +530,30 @@ export default function App() {
 
           <section className="metric-grid">
             <div className="metric-card">
-              <span className="metric-icon blue"><BusFront size={19}/></span>
-              <div><span>Currently inside</span><strong>{insideCount}</strong><small>Based on the latest recorded movement</small></div>
+              <span className="metric-icon blue"><BusFront size={19} /></span>
+              <div>
+                <span>Currently inside</span>
+                <strong>{insideCount}</strong>
+                <small>Based on the latest recorded movement</small>
+              </div>
             </div>
+
             <div className="metric-card">
-              <span className="metric-icon green"><ArrowDownToLine size={19}/></span>
-              <div><span>Today's arrivals</span><strong>{today.filter(item => item.direction === "IN").length}</strong><small>Recorded today</small></div>
+              <span className="metric-icon green"><ArrowDownToLine size={19} /></span>
+              <div>
+                <span>Today's arrivals</span>
+                <strong>{today.filter(item => item.direction === "IN").length}</strong>
+                <small>Recorded today</small>
+              </div>
             </div>
+
             <div className="metric-card">
-              <span className="metric-icon orange"><ArrowUpFromLine size={19}/></span>
-              <div><span>Today's departures</span><strong>{today.filter(item => item.direction === "OUT").length}</strong><small>Recorded today</small></div>
+              <span className="metric-icon orange"><ArrowUpFromLine size={19} /></span>
+              <div>
+                <span>Today's departures</span>
+                <strong>{today.filter(item => item.direction === "OUT").length}</strong>
+                <small>Recorded today</small>
+              </div>
             </div>
           </section>
 
@@ -549,39 +567,37 @@ export default function App() {
                     <p>Automatic scanning · full camera view</p>
                   </div>
                   <span className={`pill ${cameraOn ? "pill-live" : ""}`}>
-                    <span/>{cameraOn ? "Live" : "Standby"}
+                    <span />{cameraOn ? "Live" : "Standby"}
                   </span>
                 </div>
 
                 <div className={`camera-view ${cameraOn ? "camera-running" : ""}`}>
                   {cameraOn ? (
-                    <video ref={videoRef} autoPlay playsInline muted/>
+                    <video ref={videoRef} autoPlay playsInline muted />
                   ) : (
                     <div className="camera-empty">
-                      <div className="camera-symbol"><Camera size={28}/></div>
+                      <div className="camera-symbol"><Camera size={28} /></div>
                       <strong>Ready when you are</strong>
                       <span>Start the camera to scan the whole view.</span>
                     </div>
                   )}
 
-                  {cameraOn && (
-                    <>
-                      <div className="view-corner corner-tl"/>
-                      <div className="view-corner corner-tr"/>
-                      <div className="view-corner corner-bl"/>
-                      <div className="view-corner corner-br"/>
-                      <div className="view-scan-line"/>
-                    </>
-                  )}
+                  {cameraOn && <>
+                    <div className="view-corner corner-tl" />
+                    <div className="view-corner corner-tr" />
+                    <div className="view-corner corner-bl" />
+                    <div className="view-corner corner-br" />
+                    <div className="view-scan-line" />
+                  </>}
 
                   {busy && (
                     <div className="scan-working">
-                      <Activity size={17}/><span>Reading frame…</span>
+                      <Activity size={17} /><span>Reading frame…</span>
                     </div>
                   )}
 
                   <div className="camera-label">
-                    <span className={`status-light ${cameraOn ? "light-on" : ""}`}/>
+                    <span className={`status-light ${cameraOn ? "light-on" : ""}`} />
                     {cameraOn ? "AUTO SCAN ACTIVE" : "CAMERA OFF"}
                     <span className="camera-label-right">NO FIXED PLATE BOX</span>
                   </div>
@@ -592,23 +608,26 @@ export default function App() {
                     className={`btn ${cameraOn ? "btn-muted" : "btn-primary"}`}
                     onClick={cameraOn ? stopCamera : startCamera}
                   >
-                    {cameraOn ? <CameraOff size={17}/> : <Camera size={17}/>}
+                    {cameraOn ? <CameraOff size={17} /> : <Camera size={17} />}
                     {cameraOn ? "Stop camera" : "Start live scan"}
                   </button>
+
                   <button
                     className="btn btn-secondary"
                     onClick={() => void captureNow()}
                     disabled={!cameraOn || busy}
                   >
-                    <Zap size={17}/> Capture now
+                    <Zap size={17} /> Capture now
                   </button>
+
                   <button
                     className="btn btn-secondary"
                     onClick={() => uploadRef.current?.click()}
                     disabled={busy}
                   >
-                    <UploadCloud size={17}/> Upload image
+                    <UploadCloud size={17} /> Upload image
                   </button>
+
                   <input
                     ref={uploadRef}
                     hidden
@@ -623,16 +642,18 @@ export default function App() {
 
                 <div className={`scan-message ${error ? "message-error" : ""}`}>
                   <span className="message-icon">
-                    {error ? <X size={17}/> : <Activity size={17}/>}
+                    {error ? <X size={17} /> : <Activity size={17} />}
                   </span>
                   <div>
-                    <strong>{error ? "Needs attention" : busy ? "Processing frame" : "Scanner status"}</strong>
+                    <strong>
+                      {error ? "Needs attention" : busy ? "Processing frame" : "Scanner status"}
+                    </strong>
                     <p>{error || status}</p>
                   </div>
                 </div>
 
                 <div className="small-note">
-                  <ShieldCheck size={15}/>
+                  <ShieldCheck size={15} />
                   OCR is best-effort. Distance, glare, motion blur and camera quality affect results.
                 </div>
               </div>
@@ -644,7 +665,7 @@ export default function App() {
                       <span className="eyebrow">DETECTION RESULT</span>
                       <h3>Recognized plate</h3>
                     </div>
-                    <CheckCircle2 className="result-check" size={25}/>
+                    <CheckCircle2 className="result-check" size={25} />
                   </div>
 
                   <div className={`plate-display ${plate ? "plate-found" : ""}`}>
@@ -652,8 +673,13 @@ export default function App() {
                     <strong>{plate || "— — — — — —"}</strong>
                   </div>
 
-                  <p className="plate-help">Review the detected number. Edit it if the camera misreads a character.</p>
-                  <label className="input-label" htmlFor="plate-entry">EDIT / ENTER NUMBER PLATE</label>
+                  <p className="plate-help">
+                    Review the detected number. Edit it if the camera misreads a character.
+                  </p>
+
+                  <label className="input-label" htmlFor="plate-entry">
+                    EDIT / ENTER NUMBER PLATE
+                  </label>
 
                   <div className="plate-edit">
                     <input
@@ -664,37 +690,46 @@ export default function App() {
                       maxLength={12}
                     />
                     <button onClick={() => setPlate("")} aria-label="Clear plate">
-                      <X size={16}/>
+                      <X size={16} />
                     </button>
                   </div>
 
                   <div className="movement-buttons">
                     <button
                       className="btn btn-arrival"
-                      onClick={() => { if (recordPlate(plate, "manual", "IN")) setPage("history"); }}
+                      onClick={() => {
+                        if (recordPlate(plate, "manual", "IN")) setPage("history");
+                      }}
                     >
-                      <ArrowDownToLine size={18}/>
+                      <ArrowDownToLine size={18} />
                       <span><strong>Record IN</strong><small>Bus arrives</small></span>
                     </button>
+
                     <button
                       className="btn btn-departure"
-                      onClick={() => { if (recordPlate(plate, "manual", "OUT")) setPage("history"); }}
+                      onClick={() => {
+                        if (recordPlate(plate, "manual", "OUT")) setPage("history");
+                      }}
                     >
-                      <ArrowUpFromLine size={18}/>
+                      <ArrowUpFromLine size={18} />
                       <span><strong>Record OUT</strong><small>Bus leaves</small></span>
                     </button>
                   </div>
 
                   <div className="record-tip">
-                    <CheckCircle2 size={15}/> Confirm the plate before recording.
+                    <CheckCircle2 size={15} /> Confirm the plate before recording.
                   </div>
                 </div>
 
                 <div className="surface quick-status">
-                  <div className="quick-icon"><Activity size={18}/></div>
+                  <div className="quick-icon"><Activity size={18} /></div>
                   <div>
                     <strong>{engineReady ? "Recognition engine ready" : "Preparing recognition engine"}</strong>
-                    <p>{engineReady ? "OCR worker stays loaded for repeated scans." : "The initial load may take a moment."}</p>
+                    <p>
+                      {engineReady
+                        ? "OCR worker stays loaded for repeated scans."
+                        : "The initial load may take a moment."}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -707,25 +742,27 @@ export default function App() {
                   <h3>Bus movement records <span className="count">{visibleEntries.length}</span></h3>
                   <p>Search, filter, and export the records saved in this browser.</p>
                 </div>
+
                 <div className="history-actions">
                   <button className="btn btn-secondary" onClick={exportCsv}>
-                    <Download size={16}/> Export CSV
+                    <Download size={16} /> Export CSV
                   </button>
                   <button className="btn btn-danger" onClick={clearRecords}>
-                    <Trash2 size={16}/> Clear records
+                    <Trash2 size={16} /> Clear records
                   </button>
                 </div>
               </div>
 
               <div className="history-tools">
                 <label className="search-input">
-                  <Search size={17}/>
+                  <Search size={17} />
                   <input
                     value={search}
                     onChange={event => setSearch(event.target.value)}
                     placeholder="Search number plate…"
                   />
                 </label>
+
                 <div className="filter-tabs">
                   {(["ALL", "IN", "OUT"] as const).map(value => (
                     <button
@@ -743,21 +780,33 @@ export default function App() {
                 <table>
                   <thead>
                     <tr>
-                      <th>BUS NUMBER PLATE</th><th>DIRECTION</th><th>DATE & TIME</th><th>SOURCE</th>
+                      <th>BUS NUMBER PLATE</th>
+                      <th>DIRECTION</th>
+                      <th>DATE & TIME</th>
+                      <th>SOURCE</th>
                     </tr>
                   </thead>
+
                   <tbody>
                     {visibleEntries.slice(0, 200).map(item => (
                       <tr key={item.id}>
                         <td><span className="table-plate">{item.plate}</span></td>
                         <td>
                           <span className={`direction-tag ${item.direction.toLowerCase()}`}>
-                            {item.direction === "IN" ? <ArrowDownToLine size={14}/> : <ArrowUpFromLine size={14}/>}
+                            {item.direction === "IN"
+                              ? <ArrowDownToLine size={14} />
+                              : <ArrowUpFromLine size={14} />}
                             {item.direction}
                           </span>
                         </td>
                         <td>{displayDate(item.time)} · {displayTime(item.time)}</td>
-                        <td>{item.source === "camera" ? "Live OCR" : item.source === "image" ? "Image OCR" : "Manual"}</td>
+                        <td>
+                          {item.source === "camera"
+                            ? "Live OCR"
+                            : item.source === "image"
+                              ? "Image OCR"
+                              : "Manual"}
+                        </td>
                       </tr>
                     ))}
 
@@ -765,10 +814,12 @@ export default function App() {
                       <tr>
                         <td colSpan={4}>
                           <div className="empty-history">
-                            <History size={26}/>
+                            <History size={26} />
                             <strong>No movement records yet</strong>
                             <span>Scan a plate and record the movement to see it here.</span>
-                            <button className="btn btn-primary" onClick={() => setPage("scanner")}>Open scanner</button>
+                            <button className="btn btn-primary" onClick={() => setPage("scanner")}>
+                              Open scanner
+                            </button>
                           </div>
                         </td>
                       </tr>
@@ -778,16 +829,18 @@ export default function App() {
               </div>
 
               <div className="history-footer">
-                <span>Showing {Math.min(visibleEntries.length, 200)} of {visibleEntries.length} records · Saved on this device</span>
+                <span>
+                  Showing {Math.min(visibleEntries.length, 200)} of {visibleEntries.length} records · Saved on this device
+                </span>
                 <button className="clear-link" onClick={clearRecords}>
-                  <Trash2 size={14}/> Clear all
+                  <Trash2 size={14} /> Clear all
                 </button>
               </div>
             </section>
           )}
 
           <footer className="app-footer">
-            <span><ShieldCheck size={14}/> GateFlow bus movement system</span>
+            <span><ShieldCheck size={14} /> GateFlow bus movement system</span>
             <span>College expo prototype · Local records</span>
           </footer>
         </main>
