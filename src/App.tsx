@@ -1,3 +1,4 @@
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowDownToLine, ArrowUpFromLine, BusFront, Camera,
@@ -18,7 +19,7 @@ type Entry = {
 };
 
 const STORAGE_KEY = "gateflow-bus-events-v1";
-const DUPLICATE_WINDOW = 60000;
+const ABSENCE_WINDOW = 10000;
 const SCAN_INTERVAL = 900;
 
 function cleanPlate(value: string) {
@@ -71,8 +72,15 @@ export default function App() {
   const cameraRef = useRef(false);
   const busyRef = useRef(false);
   const timerRef = useRef<number | null>(null);
-  const lastRecordedRef = useRef<Record<string, number>>({});
+
+  // Last time OCR detected each plate.
+  const lastSeenRef = useRef<Record<string, number>>({});
+
+  // Track repeated matching OCR readings before accepting a new event.
   const candidateRef = useRef({ plate: "", count: 0, time: 0 });
+
+  // Prevent two asynchronous camera results from recording the same event.
+  const recordingRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     try {
@@ -106,7 +114,9 @@ export default function App() {
         setStatus("Recognition engine ready. Start scanning.");
       } catch (e) {
         console.error(e);
-        if (!cancelled) setError("OCR engine failed to load. Check your internet connection and refresh.");
+        if (!cancelled) {
+          setError("OCR engine failed to load. Check your internet connection and refresh.");
+        }
       }
     };
 
@@ -115,8 +125,11 @@ export default function App() {
     return () => {
       cancelled = true;
       cameraRef.current = false;
+
       if (timerRef.current) window.clearTimeout(timerRef.current);
+
       streamRef.current?.getTracks().forEach(track => track.stop());
+
       if (workerRef.current) void workerRef.current.terminate();
     };
   }, []);
@@ -128,7 +141,11 @@ export default function App() {
     }
   }, [cameraOn, page]);
 
-  const recordPlate = useCallback((raw: string, source: Source, direction?: Direction) => {
+  const recordPlate = useCallback((
+    raw: string,
+    source: Source,
+    direction?: Direction
+  ) => {
     const number = cleanPlate(raw);
 
     if (!validPlate(number)) {
@@ -136,23 +153,21 @@ export default function App() {
       return false;
     }
 
+    // A camera event can only be accepted after the plate has been absent
+    // for at least ABSENCE_WINDOW. Image and manual entries are explicit actions.
     const now = Date.now();
-    const lastRecorded = lastRecordedRef.current[number] || 0;
+    const lastSeen = lastSeenRef.current[number] || 0;
 
-    // Prevent repeated camera frames from creating duplicate entries.
-    // Manual IN/OUT records are always allowed.
     if (
       source === "camera" &&
-      now - lastRecorded < DUPLICATE_WINDOW
+      lastSeen > 0 &&
+      now - lastSeen < ABSENCE_WINDOW
     ) {
-      setStatus(
-        `${number} was already detected recently. Waiting for a new detection before recording again.`
-      );
+      setStatus(`${number} is still being detected. Duplicate event ignored.`);
       return false;
     }
 
-    // Determine the next movement from the latest saved record.
-    // First detection = IN; then alternate OUT, IN, OUT, and so on.
+    // Keep direction alternating based on the latest saved movement.
     const previous = entries
       .filter(item => item.plate === number)
       .sort((a, b) => b.time.localeCompare(a.time))[0];
@@ -172,11 +187,6 @@ export default function App() {
     setPlate(number);
     setError("");
     setStatus(`✓ ${number} successfully recorded as ${movement}.`);
-
-    // Apply the cooldown to camera detections only.
-    if (source === "camera") {
-      lastRecordedRef.current[number] = now;
-    }
 
     return true;
   }, [entries]);
@@ -235,17 +245,44 @@ export default function App() {
         time: now
       };
 
-      if (source === "camera" && count >= 2) {
-        // Two matching OCR reads are required before recording.
-        // recordPlate applies the 60-second duplicate protection.
-        recordPlate(match, "camera");
-        candidateRef.current = { plate: "", count: 0, time: 0 };
-      } else if (source === "image") {
-        // Capture now and uploaded images are explicit scan actions.
+      if (source === "image") {
+        // Capture/upload are deliberate scan actions.
         recordPlate(match, "image");
         candidateRef.current = { plate: "", count: 0, time: 0 };
-      } else {
-        setStatus(`Possible plate: ${match}. Checking next frame…`);
+        return;
+      }
+
+      if (source === "camera") {
+        const lastSeen = lastSeenRef.current[match] || 0;
+        const wasAbsentLongEnough =
+          lastSeen === 0 || now - lastSeen >= ABSENCE_WINDOW;
+
+        // Update last-seen time on every successful detection, even when
+        // the plate is not yet eligible for another event.
+        lastSeenRef.current[match] = now;
+
+        if (!wasAbsentLongEnough) {
+          setStatus(`${match} is still in view. Waiting for it to leave before recording again.`);
+          return;
+        }
+
+        // Require two matching reads before recording a new appearance.
+        if (count >= 2 && !recordingRef.current[match]) {
+          recordingRef.current[match] = true;
+
+          try {
+            // recordPlate normally checks lastSeenRef; remove this plate's
+            // timestamp briefly so this confirmed reappearance can be saved.
+            delete lastSeenRef.current[match];
+            recordPlate(match, "camera");
+            lastSeenRef.current[match] = now;
+          } finally {
+            recordingRef.current[match] = false;
+            candidateRef.current = { plate: "", count: 0, time: 0 };
+          }
+        } else if (count < 2) {
+          setStatus(`Possible plate: ${match}. Confirming detection…`);
+        }
       }
     } catch (e) {
       console.error(e);
@@ -307,10 +344,13 @@ export default function App() {
       streamRef.current?.getTracks().forEach(track => track.stop());
       streamRef.current = stream;
       cameraRef.current = true;
+
+      // Keep previously recorded plates remembered across a camera restart.
+      // The next event is accepted only after a fresh absence interval.
       candidateRef.current = { plate: "", count: 0, time: 0 };
 
       setCameraOn(true);
-      setStatus("Camera live. The full view is scanned automatically.");
+      setStatus("Camera live. Tracking detected plates automatically.");
 
       timerRef.current = window.setTimeout(() => void scan(), 700);
     } catch (e) {
@@ -322,16 +362,12 @@ export default function App() {
   function stopCamera() {
     cameraRef.current = false;
 
-    if (timerRef.current) {
-      window.clearTimeout(timerRef.current);
-    }
+    if (timerRef.current) window.clearTimeout(timerRef.current);
 
     streamRef.current?.getTracks().forEach(track => track.stop());
     streamRef.current = null;
 
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    if (videoRef.current) videoRef.current.srcObject = null;
 
     candidateRef.current = { plate: "", count: 0, time: 0 };
 
@@ -398,8 +434,9 @@ export default function App() {
   function clearRecords() {
     if (window.confirm("Delete all records saved in this browser?")) {
       setEntries([]);
-      lastRecordedRef.current = {};
+      lastSeenRef.current = {};
       candidateRef.current = { plate: "", count: 0, time: 0 };
+      recordingRef.current = {};
       setStatus("All local records cleared.");
     }
   }
@@ -431,23 +468,19 @@ export default function App() {
           <div className="brand-icon"><BusFront size={24}/></div>
           <div><strong>GateFlow</strong><span>SMART GATE APP</span></div>
         </div>
-
         <div className="nav-label">WORKSPACE</div>
-
         <button
           className={`nav-item ${page === "scanner" ? "nav-active" : ""}`}
           onClick={() => { setPage("scanner"); setMenuOpen(false); }}
         >
           <Camera size={18}/> Live scanner
         </button>
-
         <button
           className={`nav-item ${page === "history" ? "nav-active" : ""}`}
           onClick={() => { setPage("history"); setMenuOpen(false); }}
         >
           <History size={18}/> Movement history
         </button>
-
         <div className="sidebar-bottom">
           <div className="security-mark">
             <ShieldCheck size={18}/>
@@ -466,12 +499,10 @@ export default function App() {
           >
             <Menu size={21}/>
           </button>
-
           <div>
             <span className="header-kicker">COLLEGE TRANSPORT</span>
             <h1>{page === "scanner" ? "Live bus scanner" : "Movement history"}</h1>
           </div>
-
           <div className="header-status">
             <span className={`status-light ${cameraOn ? "light-on" : ""}`}/>
             {cameraOn ? "CAMERA LIVE" : "SYSTEM READY"}
@@ -488,9 +519,7 @@ export default function App() {
             <div className="today-chip">
               <Clock3 size={16}/>
               {new Date().toLocaleDateString([], {
-                weekday: "short",
-                day: "numeric",
-                month: "short"
+                weekday: "short", day: "numeric", month: "short"
               })}
             </div>
           </section>
@@ -500,12 +529,10 @@ export default function App() {
               <span className="metric-icon blue"><BusFront size={19}/></span>
               <div><span>Currently inside</span><strong>{insideCount}</strong><small>Based on the latest recorded movement</small></div>
             </div>
-
             <div className="metric-card">
               <span className="metric-icon green"><ArrowDownToLine size={19}/></span>
               <div><span>Today's arrivals</span><strong>{today.filter(item => item.direction === "IN").length}</strong><small>Recorded today</small></div>
             </div>
-
             <div className="metric-card">
               <span className="metric-icon orange"><ArrowUpFromLine size={19}/></span>
               <div><span>Today's departures</span><strong>{today.filter(item => item.direction === "OUT").length}</strong><small>Recorded today</small></div>
@@ -568,7 +595,6 @@ export default function App() {
                     {cameraOn ? <CameraOff size={17}/> : <Camera size={17}/>}
                     {cameraOn ? "Stop camera" : "Start live scan"}
                   </button>
-
                   <button
                     className="btn btn-secondary"
                     onClick={() => void captureNow()}
@@ -576,7 +602,6 @@ export default function App() {
                   >
                     <Zap size={17}/> Capture now
                   </button>
-
                   <button
                     className="btn btn-secondary"
                     onClick={() => uploadRef.current?.click()}
@@ -584,7 +609,6 @@ export default function App() {
                   >
                     <UploadCloud size={17}/> Upload image
                   </button>
-
                   <input
                     ref={uploadRef}
                     hidden
@@ -652,7 +676,6 @@ export default function App() {
                       <ArrowDownToLine size={18}/>
                       <span><strong>Record IN</strong><small>Bus arrives</small></span>
                     </button>
-
                     <button
                       className="btn btn-departure"
                       onClick={() => { if (recordPlate(plate, "manual", "OUT")) setPage("history"); }}
@@ -703,7 +726,6 @@ export default function App() {
                     placeholder="Search number plate…"
                   />
                 </label>
-
                 <div className="filter-tabs">
                   {(["ALL", "IN", "OUT"] as const).map(value => (
                     <button
@@ -720,7 +742,9 @@ export default function App() {
               <div className="table-scroll">
                 <table>
                   <thead>
-                    <tr><th>BUS NUMBER PLATE</th><th>DIRECTION</th><th>DATE & TIME</th><th>SOURCE</th></tr>
+                    <tr>
+                      <th>BUS NUMBER PLATE</th><th>DIRECTION</th><th>DATE & TIME</th><th>SOURCE</th>
+                    </tr>
                   </thead>
                   <tbody>
                     {visibleEntries.slice(0, 200).map(item => (
